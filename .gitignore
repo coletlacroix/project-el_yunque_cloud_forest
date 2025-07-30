@@ -1,0 +1,48 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+
+# === Ignore data files ===
+*.csv
+*.tsv
+*.xlsx
+*.xls
+*.sav
+*.rds
+*.rda
+
+# === Ignore output and reports ===
+*.pdf
+*.docx
+*.pptx
+*.html
+
+# === Ignore figures ===
+*.png
+*.jpg
+*.jpeg
+*.tiff
+*.bmp
+*.svg
+
+# === Ignore R session files ===
+.Rhistory
+.RData
+.Rproj.user/
+.Ruserdata
+.Rapp.history
+
+# === Ignore project outputs ===
+/output/
+/figures/
+/cache/
+/reports/
+
+# === Optional: Ignore markdown/knitr intermediates ===
+*.utf8.md
+*.knit.md
+*.nb.html
+
+# === Mac system files ===
+.DS_Store
