@@ -1,0 +1,285 @@
+---
+title: "01 - clouds and light"
+author: "Cole LaCroix"
+date: "2025-07-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message=FALSE, warning=FALSE, echo=FALSE}
+# libraries
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(zoo)
+library(forecast)
+
+# Uploading weather data.
+# Data acquired from NASA POWER data set. 
+# https://power.larc.nasa.gov/data-access-viewer/
+# This website allows you to select a point on the map to acquire data from. 
+# I selected from lat 18.38 lon -65.60, northeast of el yunque near the coast.
+# This gives best estimate of variables as they come from the sea to the forest.
+
+weather_data <- read.csv(
+  "/Users/colelacroix/Downloads/POWER_Point_Daily_19810101_20241231_018d38N_065d62W_LST.csv",
+  skip = 13, header = TRUE
+)
+```
+
+
+```{r}
+glimpse(weather_data)
+range(weather_data$RH2M)
+```
+
+
+```{r}
+# ----- setting up dates -----
+weather_data$YEAR <- as.numeric(weather_data$YEAR)
+weather_data$DOY <- as.numeric(weather_data$DOY)
+weather_data$Date <- as.Date(weather_data$DOY - 1, origin = paste0(weather_data$YEAR, "-01-01"))
+```
+
+
+```{r}
+# ----- estimating cloud base height -----
+estimate_cbh <- function(temp_c, rh_percent) {
+
+  # finding dew pt using Lawrence method (described as accurate above 50% rh)
+  #https://journals.ametsoc.org/view/journals/bams/86/2/bams-86-2-225.xml?tab_body=pdf
+  dew_point <- temp_c - ((100 - rh_percent)/5)
+  
+  # applying the lapse rate
+  # https://www.eoas.ubc.ca/courses/atsc113/flying/met_concepts/01-met_concepts/01d-ceilings/zlcl.html
+  (temp_c - dew_point) * 125
+}
+weather_data$CBH_meters <- estimate_cbh(weather_data$T2M, weather_data$RH2M)
+
+glimpse(weather_data)
+```
+
+
+```{r}
+# ----- estimating solar radiation -----
+
+# latitude as sourced from NASA POWER portal
+latitude <- 18.38
+lat_rad <- latitude * pi / 180
+
+# as indicated by FAO (appropriate for coastal areas)
+# https://www.fao.org/4/x0490e/x0490e07.htm#chapter%203%20%20%20meteorological%20data
+k_rs <- 0.19
+
+calculate_ra <- function(doy, lat_rad) {
+  # solar constant
+  G_sc <- 0.0820
+  
+  # inverse relative distance, earth to sun
+  dr <- 1 + 0.033 * cos(2 * pi * doy / 365)
+  
+  # solar declination 
+  solar_decl <- 0.409 * sin(2 * pi * doy / 365 - 1.39)
+  
+  # sunset hour angle
+  ws <- acos(-tan(lat_rad) * tan(solar_decl))
+  
+  # incoming radiation
+  (24 * 60 / pi) * G_sc * dr * (ws * sin(lat_rad) * sin(solar_decl) + cos(lat_rad) * cos(solar_decl) * sin(ws))
+}
+```
+
+
+```{r}
+# ----- estimating cloudiness -----
+
+# calculating extraterrestrial radiation
+weather_data$Ra <- calculate_ra(weather_data$DOY, lat_rad)
+
+# calculating solar radiation at the surface 
+weather_data$Rs_MJ_m2_day <- k_rs * sqrt(weather_data$T2M_MAX - weather_data$T2M_MIN) * weather_data$Ra
+
+# cloudiness index
+weather_data$Kt <- weather_data$Rs_MJ_m2_day / weather_data$Ra
+
+# cloudy day binary (.25 described as value for dense cloud cover)
+weather_data$cloudy_day <- ifelse(weather_data$Kt < 0.25, 1, 0)
+```
+
+
+```{r}
+# ----- estimating cloud immersion at different elevations -----
+
+elevation_bands <- seq(150, 1000, by = 25)
+immersion_daily <- data.frame(Date = weather_data$Date)
+for (elev in elevation_bands) {
+  immersion_daily[[paste0("Elev_", elev, "m")]] <- ifelse(
+    weather_data$cloudy_day == 1 & elev >= weather_data$CBH_meters, 1, 0
+  )
+}
+```
+
+
+```{r}
+# ----- Creating a 1000-day rolling average -----
+
+rolling_cloud_immersion <- immersion_daily %>%
+  mutate(across(starts_with("Elev_"), ~ rollapply(
+    .x, width = 1000, FUN = function(x) mean(x, na.rm = TRUE) * 100,
+    fill = NA, align = "right"
+  )))
+```
+
+
+```{r}
+# ----- Creating times series objects for decomposition -----
+
+temp_ts <- ts(weather_data$T2M, start = c(min(weather_data$YEAR)), frequency = 365.25)
+rh_ts <- ts(weather_data$RH2M, start = c(min(weather_data$YEAR)), frequency = 365.25)
+cbh_ts <- ts(weather_data$CBH_meters, start = c(min(weather_data$YEAR)), frequency = 365.25)
+
+temp_stl <- stl(temp_ts, s.window = "periodic")
+rh_stl <- stl(rh_ts, s.window = "periodic")
+cbh_stl <- stl(cbh_ts, s.window = "periodic")
+```
+
+
+```{r}
+plot(temp_stl, main = "STL Decomposition of Average Temperature (T2M)")
+```
+
+
+```{r}
+plot(rh_stl, main = "STL Decomposition of Relative Humidity (RH2M)")
+```
+
+
+```{r}
+plot(cbh_stl, main = "STL Decomposition of Cloud Base Height (CBH_meters)")
+```
+
+
+```{r}
+# ----- Plotting cloud base height -----
+
+ggplot(weather_data, aes(x = Date, y = CBH_meters)) +
+  geom_point(alpha = 0.3, color = "lightblue") +
+  geom_smooth(method = "loess", span = 2, color = "darkblue", size = 1.2) +
+  labs(
+    title = "Estimated Cloud Base Height (Smoothed Trend)",
+    x = "Date", y = "Cloud Base Height (meters)"
+  ) + theme_minimal()
+```
+
+
+```{r}
+# ----- Cloud base height trend zoomed in -----
+
+# extract trend component
+cbh_trend <- cbh_stl$time.series[, "trend"]
+
+# create a data frame with Date and trend
+cbh_trend_df <- data.frame(
+  Date = weather_data$Date,
+  Trend = as.numeric(cbh_trend)
+)
+
+# calculate max and min of the trend
+trend_max <- max(cbh_trend_df$Trend, na.rm = TRUE)
+trend_min <- min(cbh_trend_df$Trend, na.rm = TRUE)
+
+ggplot(cbh_trend_df, aes(x = Date, y = Trend)) +
+  geom_line(color = "steelblue", size = 1) +
+  geom_hline(yintercept = trend_max, linetype = "dashed", color = "red") +
+  geom_hline(yintercept = trend_min, linetype = "dashed", color = "blue") +
+  labs(
+    title = "Trend Component of Cloud Base Height (STL)",
+    subtitle = "Dashed lines show max (red) and min (blue) trend values",
+    x = "Date", y = "CBH Trend (meters)"
+  ) +
+  theme_minimal()
+
+```
+
+
+```{r, warning=FALSE}
+# ----- Cloud immersion(%) at 750m through time -----
+
+# In its atlas, the forest service depicts the cloud immersion line at 600m. 
+# (preface, VI) https://www.srs.fs.usda.gov/pubs/gtr/gtr_srs193.pdf
+
+immersion_daily <- immersion_daily %>%
+  mutate(Rolling_1000day_750m = rollapply(Elev_750m, width = 1000, FUN = function(x) mean(x, na.rm = TRUE) * 100, fill = NA, align = "right"))
+
+ggplot(immersion_daily, aes(x = Date, y = Rolling_1000day_750m)) +
+  geom_line(color = "lightblue", size = .5) +
+  geom_smooth(method = "loess", span = 0.5, color = "navy", se = FALSE) +
+  labs(
+    title = "Rolling 1000-Day Cloud Immersion at 750m Elevation",
+    x = "Date", y = "% Days Immersed in Cloud"
+  ) + theme_minimal()
+```
+
+
+```{r}
+# ----- Plotting solar radiation -----
+
+ggplot(weather_data, aes(x = Date, y = Rs_MJ_m2_day)) +
+  geom_point(alpha = 0.3, color = "orange") +
+  geom_smooth(method = "loess", span = 2, color = "red", size = 1.2) +
+  labs(
+    title = "Estimated Daily Solar Radiation (Smoothed Trend)",
+    subtitle = "Hargreaves Method",
+    x = "Date", y = "Solar Radiation (MJ/m²/day)"
+  ) + theme_minimal()
+```
+
+
+```{r}
+# ------ Solar radiation trend zoomed in -----
+
+# fit LOESS 
+loess_fit <- loess(Rs_MJ_m2_day ~ as.numeric(Date), data = weather_data, span = 0.5)
+weather_data$Rs_smoothed <- predict(loess_fit)
+
+# calculate bounds
+rs_max <- max(weather_data$Rs_smoothed, na.rm = TRUE)
+rs_min <- min(weather_data$Rs_smoothed, na.rm = TRUE)
+
+
+ggplot(weather_data, aes(x = Date)) +
+  geom_line(aes(y = Rs_smoothed), color = "red", size = 1.2) +
+  geom_hline(yintercept = rs_max, linetype = "dashed", color = "darkred") +
+  geom_hline(yintercept = rs_min, linetype = "dashed", color = "darkblue") +
+  labs(
+    title = "Smoothed Solar Radiation Trend Over Time",
+    subtitle = "Hargreaves Method — Dashed Lines Show Max and Min of Trend",
+    x = "Date", y = "Solar Radiation (MJ/m²/day)"
+  ) +
+  theme_minimal()
+```
+
+
+```{r}
+# ----- Plot CBH colored by cloudiness -----
+
+weather_data$cloudy_pct_1000day <- rollapply(
+  weather_data$cloudy_day, width = 1000,
+  FUN = function(x) mean(x, na.rm = TRUE) * 100,
+  align = "right", fill = NA
+)
+
+
+ggplot(weather_data, aes(x = Date, y = CBH_meters, color = cloudy_pct_1000day)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "loess", span = 1.5, color = "black", se = FALSE, size = .7) +
+  scale_color_viridis_c(option = "plasma", direction = -1, name = "% Cloudy Days (1000-Day Rolling)") +
+  labs(
+    title = "Cloud Base Height Colored by % of Cloudy Days (1000-Day Rolling)",
+    x = "Date", y = "Cloud Base Height (meters)"
+  ) + theme_minimal()
+```
+
