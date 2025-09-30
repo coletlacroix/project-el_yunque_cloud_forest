@@ -1,0 +1,25 @@
+---
+title: "02 - Monteverde Tree Cellulose"
+author: "Cole LaCroix"
+date: "2025-09-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+```
+
+```{r}
+cellulose <- read.csv('/Users/colelacroix/Downloads/2025.9.20 Montverde Cloud Forest Tree Cellulose.csv', 
+                      skip = 98, header = TRUE)
+
+print(cellulose)
+```
+```{r}
+cellulose$date <- as.Date(date_decimal(as.numeric(cellulose$age_AD)))
+
+print(cellulose)
+```
+
