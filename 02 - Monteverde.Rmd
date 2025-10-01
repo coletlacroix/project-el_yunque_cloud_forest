@@ -22,4 +22,7 @@ cellulose$date <- as.Date(date_decimal(as.numeric(cellulose$age_AD)))
 
 print(cellulose)
 ```
+```{r}
+summary(cellulose)
+```
 
