@@ -1,0 +1,224 @@
+---
+title: "02 - Monteverde Clean"
+author: "Cole LaCroix"
+date: "2025-10-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# ---- STEP 1: Load cellulose and climate data ----
+library(tidyverse)
+library(lubridate)
+
+# ---- Cellulose data ----
+# Replace this path if needed
+cellulose <- read_csv(
+  '/Users/colelacroix/Downloads/2025.9.20 Montverde Cloud Forest Tree Cellulose.csv',
+  skip = 98,
+  show_col_types = FALSE
+) %>%
+  select(age_AD, d18Ocellulose) %>%
+  # Convert fractional year (e.g., 1900.38) to actual Date
+  mutate(
+    year  = floor(age_AD),
+    frac  = age_AD - year,
+    date  = as.Date(paste0(year, "-01-01")) + floor(frac * 365.25)
+  ) %>%
+  filter(!is.na(date), !is.na(d18Ocellulose)) %>%
+  arrange(date)
+
+# ---- Climate data (daily, enriched) ----
+climate <- read_csv(
+  "cmip6_timeseries/IPSL_boxmean_daily_1902_2002_enriched_lat10.2.csv",
+  show_col_types = FALSE
+) %>%
+  mutate(date = as.Date(date)) %>%
+  arrange(date)
+
+# ---- Quick checks ----
+cat("Cellulose samples:", nrow(cellulose), "records\n")
+cat("Climate records:", nrow(climate), "daily observations\n")
+
+# Confirm columns exist
+glimpse(cellulose)
+glimpse(climate)
+
+```
+```{r}
+# ---- STEP 2: Compute and visualize CBH and solar radiation trends ----
+library(tidyverse)
+library(lubridate)
+
+# --- Constants ---
+latitude <- 10.2     # degrees N
+k_rs <- 0.19         # Hargreaves coefficient
+kt_threshold <- 0.24 # everything above = sunny, below = cloudy
+
+# --- Helper functions ---
+estimate_cbh <- function(temp_c, rh_percent) {
+  dew_point <- temp_c - ((100 - rh_percent) / 5)
+  (temp_c - dew_point) * 125  # m
+}
+
+calculate_ra <- function(doy, lat_deg) {
+  lat_rad <- lat_deg * pi / 180
+  G_sc <- 0.0820
+  dr <- 1 + 0.033 * cos(2 * pi * doy / 365)
+  decl <- 0.409 * sin(2 * pi * doy / 365 - 1.39)
+  ws <- acos(pmax(pmin(-tan(lat_rad) * tan(decl), 1), -1))
+  (24 * 60 / pi) * G_sc * dr *
+    (ws * sin(lat_rad) * sin(decl) + cos(lat_rad) * cos(decl) * sin(ws))
+}
+
+# --- Compute CBH and radiation variables ---
+climate_proc <- climate %>%
+  mutate(
+    CBH_m = estimate_cbh(tas_C, hurs_pct),
+    Ra_MJ_m2_day = calculate_ra(yday(date), latitude),
+    Rs_MJ_m2_day = k_rs * sqrt(pmax(tasmax_C - tasmin_C, 0)) * Ra_MJ_m2_day,
+    Kt = pmin(pmax(Rs_MJ_m2_day / Ra_MJ_m2_day, 0), 1),
+    sunny  = as.integer(Kt >  kt_threshold),
+    cloudy = as.integer(Kt <= kt_threshold),
+    year   = year(date)
+  )
+
+# --- Summarize annual means ---
+annual <- climate_proc %>%
+  group_by(year) %>%
+  summarise(
+    CBH_mean   = mean(CBH_m, na.rm = TRUE),
+    Rs_mean    = mean(Rs_MJ_m2_day, na.rm = TRUE),
+    sunny_frac = mean(sunny, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# --- Plot: mean annual CBH ---
+ggplot(annual, aes(year, CBH_mean)) +
+  geom_line(color = "steelblue") +
+  geom_smooth(method = "loess", se = FALSE, color = "black") +
+  labs(
+    title = "Mean Cloud-Base Height (CBH) Over Time",
+    x = "Year", y = "CBH (m)"
+  ) +
+  theme_minimal()
+
+# --- Plot: mean annual surface solar radiation ---
+ggplot(annual, aes(year, Rs_mean)) +
+  geom_line(color = "darkorange") +
+  geom_smooth(method = "loess", se = FALSE, color = "black") +
+  labs(
+    title = "Mean Surface Solar Radiation (Rs) Over Time",
+    x = "Year", y = "Rs (MJ m⁻² day⁻¹)"
+  ) +
+  theme_minimal()
+
+# --- Plot: fraction of sunny days per year ---
+ggplot(annual, aes(year, sunny_frac)) +
+  geom_line(color = "goldenrod") +
+  geom_smooth(method = "loess", se = FALSE, color = "black") +
+  labs(
+    title = "Sunny-Day Fraction Over Time",
+    x = "Year", y = "Fraction of Days with Kt > 0.24"
+  ) +
+  theme_minimal()
+
+```
+```{r}
+# ---- STEP 3: Summarize climate between cellulose samples and compare with δ18O ----
+library(tidyverse)
+library(lubridate)
+
+# --- Define interval breaks from cellulose sampling dates ---
+breaks <- c(min(cellulose$date) - 1, cellulose$date)
+
+# Assign each daily record to the nearest cellulose sampling interval
+daily_labeled <- climate_proc %>%
+  mutate(
+    sample_date = cut(date, breaks = breaks, labels = cellulose$date, right = TRUE),
+    sample_date = as.Date(as.character(sample_date))
+  ) %>%
+  filter(!is.na(sample_date))
+
+# --- Summarize cloudy/sunny conditions per interval ---
+interval_summary <- daily_labeled %>%
+  group_by(sample_date) %>%
+  summarise(
+    n_days       = n(),
+    cloudy_days  = sum(cloudy, na.rm = TRUE),
+    sunny_days   = sum(sunny, na.rm = TRUE),
+    cloudy_frac  = mean(cloudy, na.rm = TRUE),
+    Rs_mean      = mean(Rs_MJ_m2_day, na.rm = TRUE),
+    CBH_mean     = mean(CBH_m, na.rm = TRUE),
+    tas_mean     = mean(tas_C, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# --- Merge δ18O cellulose values with interval climate ---
+interval_data <- interval_summary %>%
+  left_join(cellulose, by = c("sample_date" = "date")) %>%
+  select(sample_date, d18Ocellulose, cloudy_days, sunny_days,
+         cloudy_frac, Rs_mean, CBH_mean, tas_mean)
+
+# ---- Check alignment ----
+glimpse(interval_data)
+
+# ---- Plot δ18O vs cloudiness ----
+ggplot(interval_data, aes(cloudy_frac, d18Ocellulose)) +
+  geom_point(alpha = 0.6, color = "steelblue") +
+  geom_smooth(method = "loess", se = TRUE, color = "black") +
+  labs(
+    title = "δ18O in Cellulose vs. Cloudy-Day Fraction",
+    x = "Fraction of Cloudy Days Between Sampling Dates",
+    y = "δ18O in Cellulose (‰)"
+  ) +
+  theme_minimal()
+
+# ---- Optional: add simple linear model ----
+fit <- lm(d18Ocellulose ~ cloudy_frac, data = interval_data)
+summary(fit)
+
+
+```
+```{r}
+fit_multi <- lm(d18Ocellulose ~ cloudy_frac + Rs_mean + tas_mean, data = interval_data)
+summary(fit_multi)
+
+```
+```{r}
+# ---- STEP 4: Plot δ18O in cellulose over time ----
+library(ggplot2)
+library(dplyr)
+
+ggplot(cellulose, aes(x = date, y = d18Ocellulose)) +
+  geom_line(color = "steelblue", linewidth = 0.6) +
+  geom_point(size = 0.8, color = "black", alpha = 0.6) +
+  geom_smooth(method = "loess", se = TRUE, color = "darkred", linewidth = 1) +
+  labs(
+    title = expression(paste("δ"^18,"O in Tree Cellulose (Montverde Cloud Forest, 1900–2002)")),
+    x = "Year",
+    y = expression(paste("δ"^18,"O (‰)"))
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    panel.grid.minor = element_blank()
+  )
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+

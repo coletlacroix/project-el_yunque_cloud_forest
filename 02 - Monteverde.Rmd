@@ -25,4 +25,806 @@ print(cellulose)
 ```{r}
 summary(cellulose)
 ```
+```{r}
+# Replace this with the absolute path to the folder that holds the .nc files
+py_dir <- "/Users/colelacroix/cmip6_downloads/cmip6_clean"  # <- change me
+
+stopifnot(dir.exists(py_dir))
+
+# Make a local folder inside your R project
+dir_clean <- file.path(getwd(), "cmip6_clean")
+dir.create(dir_clean, showWarnings = FALSE)
+
+files <- c(
+  "IPSL_hist_r1i1p1f1_tas_daily_1902_2002.nc",
+  "IPSL_hist_r1i1p1f1_tasmax_daily_1902_2002.nc",
+  "IPSL_hist_r1i1p1f1_tasmin_daily_1902_2002.nc",
+  "IPSL_hist_r1i1p1f1_hurs_monthly_1902_2002.nc"
+)
+
+ok <- file.copy(file.path(py_dir, files), dir_clean, overwrite = TRUE)
+if (!all(ok)) {
+  missing <- files[!ok]
+  stop("These files were not found in py_dir:\n", paste(missing, collapse = "\n"))
+}
+
+cat("Copied files to:", dir_clean, "\n")
+list.files(dir_clean, pattern = "\\.nc$", full.names = TRUE)
+
+```
+```{r}
+library(terra); library(dplyr); library(readr); library(lubridate)
+
+dir_clean <- file.path(getwd(), "cmip6_clean")
+stopifnot(dir.exists(dir_clean))
+
+f_tas    <- file.path(dir_clean, "IPSL_hist_r1i1p1f1_tas_daily_1902_2002.nc")
+f_tasmax <- file.path(dir_clean, "IPSL_hist_r1i1p1f1_tasmax_daily_1902_2002.nc")
+f_tasmin <- file.path(dir_clean, "IPSL_hist_r1i1p1f1_tasmin_daily_1902_2002.nc")
+f_hurs   <- file.path(dir_clean, "IPSL_hist_r1i1p1f1_hurs_monthly_1902_2002.nc")
+stopifnot(file.exists(f_tas), file.exists(f_tasmax), file.exists(f_tasmin), file.exists(f_hurs))
+
+r_tas    <- rast(f_tas)
+r_tasmax <- rast(f_tasmax)
+r_tasmin <- rast(f_tasmin)
+r_hurs   <- rast(f_hurs)
+
+mean_tas    <- global(r_tas,    "mean", na.rm = TRUE)[,1]
+mean_tasmax <- global(r_tasmax, "mean", na.rm = TRUE)[,1]
+mean_tasmin <- global(r_tasmin, "mean", na.rm = TRUE)[,1]
+mean_hurs   <- global(r_hurs,   "mean", na.rm = TRUE)[,1]
+
+t_tas    <- as.Date(time(r_tas))
+t_tasmax <- as.Date(time(r_tasmax))
+t_tasmin <- as.Date(time(r_tasmin))
+t_hurs   <- as.Date(time(r_hurs))
+
+df_tas    <- tibble(date = t_tas,    tas_C    = mean_tas    - 273.15)
+df_tasmax <- tibble(date = t_tasmax, tasmax_C = mean_tasmax - 273.15)
+df_tasmin <- tibble(date = t_tasmin, tasmin_C = mean_tasmin - 273.15)
+df_hurs   <- tibble(date = t_hurs,   hurs_pct = mean_hurs)
+
+daily <- df_tas %>%
+  full_join(df_tasmax, by = "date") %>%
+  full_join(df_tasmin, by = "date") %>%
+  arrange(date)
+
+hurs_daily_interp <- approx(
+  x = as.numeric(df_hurs$date),
+  y = df_hurs$hurs_pct,
+  xout = as.numeric(daily$date)
+)$y
+
+daily_aligned <- daily %>% mutate(hurs_pct_daily_interp = hurs_daily_interp)
+
+dir.create("cmip6_timeseries", showWarnings = FALSE)
+write_csv(daily_aligned, "cmip6_timeseries/IPSL_boxmean_daily_1902_2002.csv")
+
+```
+
+```{r}
+# ---- Recompute CBH + sunny/cloudy with latitude = 10.2 ----
+library(dplyr)
+library(lubridate)
+library(readr)
+
+latitude <- 10.2           # degrees N (updated)
+k_rs <- 0.19               # Hargreaves coastal coefficient
+kt_cloudy_thr <- 0.25      # cloudy if Kt < 0.25
+kt_sunny_thr  <- 0.60      # sunny if Kt >= 0.60
+
+# Load your daily box-mean series
+daily <- read_csv("cmip6_timeseries/IPSL_boxmean_daily_1902_2002.csv",
+                  show_col_types = FALSE) %>%
+  mutate(
+    date = as.Date(date),
+    year = year(date),
+    doy  = yday(date),
+    rh_pct = hurs_pct_daily_interp
+  )
+
+# CBH from T and RH (Lawrence dewpoint approx + LCL)
+estimate_cbh <- function(temp_c, rh_percent) {
+  dew_point <- temp_c - ((100 - rh_percent) / 5)   # °C
+  (temp_c - dew_point) * 125                       # meters
+}
+
+# Extraterrestrial radiation Ra (MJ m^-2 day^-1)
+calculate_ra <- function(doy, lat_deg) {
+  lat_rad <- lat_deg * pi/180
+  G_sc <- 0.0820
+  dr <- 1 + 0.033 * cos(2*pi*doy/365)
+  decl <- 0.409 * sin(2*pi*doy/365 - 1.39)
+  ws <- acos(pmax(pmin(-tan(lat_rad) * tan(decl), 1), -1))
+  (24*60/pi) * G_sc * dr * (ws * sin(lat_rad) * sin(decl) +
+                             cos(lat_rad) * cos(decl) * sin(ws))
+}
+
+daily_enriched <- daily %>%
+  mutate(
+    CBH_meters = estimate_cbh(tas_C, rh_pct),
+    Ra = calculate_ra(doy, latitude),
+    Rs_MJ_m2_day = k_rs * sqrt(pmax(tasmax_C - tasmin_C, 0)) * Ra,  # Hargreaves
+    Kt = pmax(pmin(Rs_MJ_m2_day / Ra, 1), 0),
+    cloudy_day = as.integer(Kt < kt_cloudy_thr),
+    sunny_day  = as.integer(Kt >= kt_sunny_thr)
+  )
+
+dir.create("cmip6_timeseries", showWarnings = FALSE)
+write_csv(daily_enriched, "cmip6_timeseries/IPSL_boxmean_daily_1902_2002_enriched_lat10.2.csv")
+
+```
+
+```{r}
+# ==== DAILY → CELLULOSE-INTERVAL TOTALS (uses `cellulose` object) =============
+
+library(dplyr)
+library(readr)
+library(lubridate)
+
+# 1) Use the enriched daily file (with CBH + flags).
+daily_path <- if (file.exists("cmip6_timeseries/IPSL_boxmean_daily_1902_2002_enriched_lat10.2.csv")) {
+  "cmip6_timeseries/IPSL_boxmean_daily_1902_2002_enriched_lat10.2.csv"
+} else if (file.exists("cmip6_timeseries/IPSL_boxmean_daily_1902_2002_enriched.csv")) {
+  "cmip6_timeseries/IPSL_boxmean_daily_1902_2002_enriched.csv"
+} else {
+  stop("Couldn't find the enriched daily CSV. Please run the enrichment step first.")
+}
+
+daily <- read_csv(daily_path, show_col_types = FALSE) %>%
+  mutate(date = as.Date(date))
+
+# Ensure we have the columns we need
+needed_cols <- c("CBH_meters","sunny_day","cloudy_day","Rs_MJ_m2_day","tas_C","tasmax_C","tasmin_C")
+stopifnot(all(needed_cols %in% names(daily)))
+
+# 2) Use the `cellulose` data frame already in memory
+stopifnot(exists("cellulose"))
+
+cellulose_clean <- cellulose %>%
+  mutate(date = as.Date(date)) %>%
+  arrange(date) %>%
+  distinct(date, .keep_all = TRUE) %>%
+  filter(!is.na(date))
+
+stopifnot(nrow(cellulose_clean) > 1)
+
+# 3) Assign each daily row to the interval (prev_date, current_date]
+breaks <- c(min(cellulose_clean$date) - 1, cellulose_clean$date)
+labels <- cellulose_clean$date
+
+daily_labeled <- daily %>%
+  mutate(
+    sample_date = cut(date, breaks = breaks, labels = labels, right = TRUE),
+    sample_date = as.Date(as.character(sample_date))
+  ) %>%
+  filter(!is.na(sample_date))  # drop days before first measurement
+
+# 4) Summarise totals/means per interval
+interval_totals <- daily_labeled %>%
+  group_by(sample_date) %>%
+  summarise(
+    n_days        = dplyr::n(),
+    sunny_days    = sum(sunny_day,  na.rm = TRUE),
+    cloudy_days   = sum(cloudy_day, na.rm = TRUE),
+    Rs_MJ_m2_sum  = sum(Rs_MJ_m2_day, na.rm = TRUE),
+    CBH_m_mean    = mean(CBH_meters, na.rm = TRUE),
+    CBH_m_median  = median(CBH_meters, na.rm = TRUE),
+    tas_C_mean    = mean(tas_C,    na.rm = TRUE),
+    tasmax_C_mean = mean(tasmax_C, na.rm = TRUE),
+    tasmin_C_mean = mean(tasmin_C, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# 5) Attach cellulose metadata (age_AD, d18Ocellulose, etc.)
+interval_with_meta <- interval_totals %>%
+  left_join(
+    cellulose_clean %>% select(date, age_AD, d18Ocellulose),
+    by = c("sample_date" = "date")
+  ) %>%
+  relocate(sample_date, age_AD, d18Ocellulose)
+
+# 6) Save
+dir.create("cmip6_timeseries", showWarnings = FALSE)
+out_csv <- "cmip6_timeseries/IPSL_interval_totals_by_cellulose.csv"
+write_csv(interval_with_meta, out_csv)
+
+message("Wrote interval totals: ", out_csv)
+
+```
+```{r}
+# ===== Robust monthly climate × cellulose analysis ===========================
+suppressPackageStartupMessages({
+  library(dplyr); library(readr); library(lubridate); library(ggplot2); library(broom)
+})
+
+LATITUDE <- 10.2
+K_RS <- 0.19            # Hargreaves coastal coefficient (coastal/tropical typical)
+KT_CLOUDY <- 0.25
+KT_SUNNY  <- 0.60
+
+# <<< EDIT THIS if your amount column has a different name >>>
+CELLULOSE_AMOUNT_COL <- "cellulose_amount"  # e.g. "mass_g", "growth", etc.
+
+# --- tiny helpers
+estimate_cbh <- function(temp_c, rh_percent) {
+  # Lawrence dewpoint approx + 125 m/°C for LCL
+  dew_point <- temp_c - ((100 - rh_percent) / 5)
+  (temp_c - dew_point) * 125
+}
+calculate_ra <- function(doy, lat_deg) {
+  lat <- lat_deg * pi/180
+  G_sc <- 0.0820
+  dr <- 1 + 0.033 * cos(2*pi*doy/365)
+  decl <- 0.409 * sin(2*pi*doy/365 - 1.39)
+  ws <- acos(pmax(pmin(-tan(lat) * tan(decl), 1), -1))
+  (24*60/pi) * G_sc * dr * (ws * sin(lat) * sin(decl) + cos(lat) * cos(decl) * sin(ws))
+}
+
+# --- 1) Load daily data; enrich if needed
+daily_enriched_path_candidates <- c(
+  "cmip6_timeseries/IPSL_boxmean_daily_1902_2002_enriched_lat10.2.csv",
+  "cmip6_timeseries/IPSL_boxmean_daily_1902_2002_enriched.csv"
+)
+daily_enriched_path <- daily_enriched_path_candidates[file.exists(daily_enriched_path_candidates)][1]
+
+if (!length(daily_enriched_path)) {
+  message("Enriched daily file not found — rebuilding from base daily CSV...")
+  base_path <- "cmip6_timeseries/IPSL_boxmean_daily_1902_2002.csv"
+  if (!file.exists(base_path)) stop("Base daily file not found at: ", base_path)
+
+  daily <- read_csv(base_path, show_col_types = FALSE) %>%
+    mutate(date = as.Date(date),
+           year = year(date),
+           doy  = yday(date),
+           rh_pct = hurs_pct_daily_interp)
+
+  needed <- c("tas_C","tasmax_C","tasmin_C","rh_pct")
+  if (!all(needed %in% names(daily))) {
+    stop("Base daily file is missing some columns: ", paste(setdiff(needed, names(daily)), collapse=", "),
+         "\nMake sure you created the daily CSV with temps (°C) and interpolated RH.")
+  }
+
+  daily <- daily %>%
+    mutate(
+      CBH_meters = estimate_cbh(tas_C, rh_pct),
+      Ra = calculate_ra(doy, LATITUDE),
+      Rs_MJ_m2_day = K_RS * sqrt(pmax(tasmax_C - tasmin_C, 0)) * Ra,
+      Kt = pmax(pmin(Rs_MJ_m2_day / Ra, 1), 0),
+      sunny_day  = as.integer(Kt >= KT_SUNNY),
+      cloudy_day = as.integer(Kt <  KT_CLOUDY)
+    )
+
+  # write a reusable enriched file
+  dir.create("cmip6_timeseries", showWarnings = FALSE)
+  daily_enriched_path <- "cmip6_timeseries/IPSL_boxmean_daily_1902_2002_enriched_lat10.2.csv"
+  write_csv(daily, daily_enriched_path)
+  message("Wrote: ", daily_enriched_path)
+}
+
+daily <- read_csv(daily_enriched_path, show_col_types = FALSE) %>%
+  mutate(date = as.Date(date))
+
+# sanity
+stopifnot(all(c("CBH_meters","sunny_day","cloudy_day","Rs_MJ_m2_day","tas_C","tasmax_C","tasmin_C") %in% names(daily)))
+
+# --- 2) Aggregate climate to monthly
+monthly_clim <- daily %>%
+  mutate(month = floor_date(date, "month"),
+         diurnal_range = tasmax_C - tasmin_C) %>%
+  group_by(month) %>%
+  summarise(
+    n_days            = n(),
+    Rs_sum_MJm2       = sum(Rs_MJ_m2_day, na.rm = TRUE),
+    sunny_days        = sum(sunny_day,  na.rm = TRUE),
+    cloudy_days       = sum(cloudy_day, na.rm = TRUE),
+    sunny_frac        = sunny_days / n_days,
+    CBH_mean_m        = mean(CBH_meters, na.rm = TRUE),
+    CBH_median_m      = median(CBH_meters, na.rm = TRUE),
+    tas_C_mean        = mean(tas_C,    na.rm = TRUE),
+    tasmax_C_mean     = mean(tasmax_C, na.rm = TRUE),
+    tasmin_C_mean     = mean(tasmin_C, na.rm = TRUE),
+    diurnal_range_mean= mean(diurnal_range, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# --- 3) Collapse your cellulose df to monthly totals
+if (!exists("cellulose")) stop("`cellulose` data frame not found in memory. Please load it first.")
+if (!("date" %in% names(cellulose))) stop("`cellulose` must have a 'date' column.")
+
+if (!(CELLULOSE_AMOUNT_COL %in% names(cellulose))) {
+  stop(sprintf(
+    "Column '%s' not found in `cellulose`.\nAvailable columns:\n%s\n\nSet CELLULOSE_AMOUNT_COL accordingly at the top of this chunk.",
+    CELLULOSE_AMOUNT_COL, paste(names(cellulose), collapse = ", ")
+  ))
+}
+
+cellulose_month <- cellulose %>%
+  mutate(month = floor_date(as.Date(date), "month")) %>%
+  group_by(month) %>%
+  summarise(
+    cellulose_amount = sum(.data[[CELLULOSE_AMOUNT_COL]], na.rm = TRUE),
+    # Optional context
+    n_obs            = dplyr::n(),
+    age_AD_first     = suppressWarnings(first(na.omit(age_AD))),
+    d18Ocellulose_first = suppressWarnings(first(na.omit(d18Ocellulose))),
+    .groups = "drop"
+  )
+
+# --- 4) Merge, save
+monthly <- cellulose_month %>%
+  left_join(monthly_clim, by = "month") %>%
+  arrange(month)
+
+dir.create("cmip6_timeseries", showWarnings = FALSE)
+write_csv(monthly, "cmip6_timeseries/monthly_cellulose_climate.csv")
+
+# --- 5) Correlations + quick plots
+num <- monthly %>%
+  select(cellulose_amount, Rs_sum_MJm2, sunny_frac, CBH_mean_m, CBH_median_m,
+         tas_C_mean, tasmax_C_mean, tasmin_C_mean, diurnal_range_mean) %>%
+  na.omit()
+if (nrow(num) >= 3) print(round(cor(num), 3))
+
+p1 <- ggplot(monthly, aes(Rs_sum_MJm2, cellulose_amount)) +
+  geom_point(alpha=0.5) + geom_smooth(method="loess", se=TRUE) +
+  labs(title="Cellulose vs Monthly Solar (sum)", x="Solar radiation (MJ m⁻² / month)", y="Cellulose amount")
+p2 <- ggplot(monthly, aes(sunny_frac, cellulose_amount)) +
+  geom_point(alpha=0.5) + geom_smooth(method="loess", se=TRUE) +
+  labs(title="Cellulose vs Sunny Fraction", x="Sunny days / month", y="Cellulose amount")
+p3 <- ggplot(monthly, aes(CBH_mean_m, cellulose_amount)) +
+  geom_point(alpha=0.5) + geom_smooth(method="loess", se=TRUE) +
+  labs(title="Cellulose vs Cloud-Base Height", x="Mean CBH (m)", y="Cellulose amount")
+p4 <- ggplot(monthly, aes(diurnal_range_mean, cellulose_amount)) +
+  geom_point(alpha=0.5) + geom_smooth(method="loess", se=TRUE) +
+  labs(title="Cellulose vs Diurnal Range", x="Mean (Tmax - Tmin) (°C)", y="Cellulose amount")
+
+print(p1); print(p2); print(p3); print(p4)
+
+# --- 6) Simple models (contemporary and lag-1)
+monthly <- monthly %>%
+  arrange(month) %>%
+  mutate(
+    Rs_sum_lag1        = lag(Rs_sum_MJm2, 1),
+    sunny_frac_lag1    = lag(sunny_frac, 1),
+    CBH_mean_m_lag1    = lag(CBH_mean_m, 1),
+    diurnal_range_lag1 = lag(diurnal_range_mean, 1),
+    month_num          = month(month)
+  )
+
+fit_now  <- lm(cellulose_amount ~ Rs_sum_MJm2 + sunny_frac + CBH_mean_m + diurnal_range_mean, data = monthly)
+fit_lag1 <- lm(cellulose_amount ~ Rs_sum_lag1 + sunny_frac_lag1 + CBH_mean_m_lag1 + diurnal_range_lag1, data = monthly)
+fit_season <- lm(cellulose_amount ~ Rs_sum_MJm2 + sunny_frac + CBH_mean_m + diurnal_range_mean + factor(month_num), data = monthly)
+
+cat("\n== Contemporary model ==\n"); print(broom::glance(fit_now)); print(broom::tidy(fit_now))
+cat("\n== Lag-1 model ==\n");      print(broom::glance(fit_lag1)); print(broom::tidy(fit_lag1))
+cat("\n== Contemporary + seasonality ==\n"); print(broom::glance(fit_season)); print(broom::tidy(fit_season))
+
+```
+
+```{r}
+# ==== Climate × Cellulose, aligned to MEASUREMENT INTERVALS ===================
+# Prereqs:
+#   - daily enriched file exists (with CBH_meters, sunny_day, cloudy_day, Rs_MJ_m2_day, tas_C, tasmax_C, tasmin_C)
+#   - `cellulose` data frame in memory with at least: date, d18Ocellulose (and/or an amount column if you have one)
+
+suppressPackageStartupMessages({
+  library(dplyr); library(readr); library(lubridate); library(ggplot2); library(broom)
+})
+
+# 1) Load daily enriched (change path if your file name differs)
+daily <- read_csv("cmip6_timeseries/IPSL_boxmean_daily_1902_2002_enriched_lat10.2.csv",
+                  show_col_types = FALSE) %>%
+  mutate(date = as.Date(date))
+
+need <- c("CBH_meters","sunny_day","cloudy_day","Rs_MJ_m2_day","tas_C","tasmax_C","tasmin_C")
+stopifnot(all(need %in% names(daily)))
+stopifnot(exists("cellulose"))
+
+# 2) Clean cellulose, get ordered unique measurement dates
+cellulose_clean <- cellulose %>%
+  mutate(date = as.Date(date)) %>%
+  arrange(date) %>%
+  distinct(date, .keep_all = TRUE) %>%
+  filter(!is.na(date))
+
+stopifnot(nrow(cellulose_clean) > 1)
+
+# 3) Label each day by the *next* measurement date: (prev_date, current_date]
+breaks <- c(min(cellulose_clean$date) - 1, cellulose_clean$date)
+labels <- cellulose_clean$date
+
+daily_labeled <- daily %>%
+  mutate(
+    sample_date = cut(date, breaks = breaks, labels = labels, right = TRUE),
+    sample_date = as.Date(as.character(sample_date))
+  ) %>%
+  filter(!is.na(sample_date))   # drop days before first measurement
+
+# 4) Summarise per interval
+interval_clim <- daily_labeled %>%
+  group_by(sample_date) %>%
+  summarise(
+    interval_start       = min(date),
+    interval_end         = max(date),
+    interval_days        = dplyr::n(),
+    # radiation
+    Rs_sum_MJm2          = sum(Rs_MJ_m2_day, na.rm = TRUE),
+    Rs_mean_MJm2_day     = Rs_sum_MJm2 / interval_days,
+    # sky condition
+    sunny_days           = sum(sunny_day,  na.rm = TRUE),
+    cloudy_days          = sum(cloudy_day, na.rm = TRUE),
+    sunny_frac           = sunny_days / interval_days,
+    # clouds & temps
+    CBH_mean_m           = mean(CBH_meters, na.rm = TRUE),
+    CBH_median_m         = median(CBH_meters, na.rm = TRUE),
+    tas_C_mean           = mean(tas_C,    na.rm = TRUE),
+    tasmax_C_mean        = mean(tasmax_C, na.rm = TRUE),
+    tasmin_C_mean        = mean(tasmin_C, na.rm = TRUE),
+    diurnal_range_mean   = mean(tasmax_C - tasmin_C, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# 5) Join cellulose metadata/response back on sample_date
+interval_df <- interval_clim %>%
+  left_join(cellulose_clean, by = c("sample_date" = "date")) %>%
+  relocate(sample_date, interval_start, interval_end, interval_days)
+
+# --- Choose response variable ---
+# If you have a true "amount" column in `cellulose` (e.g., "mass_g" or "growth"),
+# set AMOUNT_COL to that name; otherwise we'll default to d18Ocellulose.
+AMOUNT_COL <- NULL  # e.g., "mass_g"
+if (!is.null(AMOUNT_COL) && AMOUNT_COL %in% names(interval_df)) {
+  interval_df <- interval_df %>%
+    mutate(cellulose_amount = .data[[AMOUNT_COL]],
+           cellulose_rate_per_day = cellulose_amount / interval_days)
+  response_var <- "cellulose_rate_per_day"
+  response_lab <- "Cellulose amount per day"
+} else {
+  response_var <- "d18Ocellulose"
+  response_lab <- "δ18Ocellulose (‰)"
+}
+
+# 6) Save the interval table
+dir.create("cmip6_timeseries", showWarnings = FALSE)
+write_csv(interval_df, "cmip6_timeseries/cellulose_interval_climate.csv")
+
+# 7) Explore relationships
+vars_to_check <- c(response_var, "Rs_mean_MJm2_day", "sunny_frac",
+                   "CBH_mean_m", "diurnal_range_mean", "tas_C_mean")
+dat <- interval_df %>% select(any_of(vars_to_check)) %>% na.omit()
+
+if (nrow(dat) >= 3) {
+  cat("\nCorrelation matrix (interval-scale):\n")
+  print(round(cor(dat), 3))
+}
+
+# Key scatterplots
+p1 <- ggplot(interval_df, aes(Rs_mean_MJm2_day, .data[[response_var]])) +
+  geom_point(alpha=.6) + geom_smooth(method="loess", se=TRUE) +
+  labs(title=paste(response_lab, "vs mean daily solar"), x="Mean daily solar (MJ m⁻² day⁻¹)", y=response_lab)
+
+p2 <- ggplot(interval_df, aes(sunny_frac, .data[[response_var]])) +
+  geom_point(alpha=.6) + geom_smooth(method="loess", se=TRUE) +
+  labs(title=paste(response_lab, "vs sunny fraction"), x="Sunny days / interval", y=response_lab)
+
+p3 <- ggplot(interval_df, aes(CBH_mean_m, .data[[response_var]])) +
+  geom_point(alpha=.6) + geom_smooth(method="loess", se=TRUE) +
+  labs(title=paste(response_lab, "vs cloud-base height"), x="Mean CBH (m)", y=response_lab)
+
+print(p1); print(p2); print(p3)
+
+# 8) Simple interval-scale models (swap predictors as you like)
+fit_now <- lm(
+  reformulate(c("Rs_mean_MJm2_day", "sunny_frac", "CBH_mean_m", "diurnal_range_mean", "tas_C_mean"),
+              response = response_var),
+  data = interval_df
+)
+cat("\n== Interval-scale linear model ==\n")
+print(broom::glance(fit_now)); print(broom::tidy(fit_now))
+
+```
+```{r}
+# ===== Collinearity, standardized effects, seasonality (no extra packages) ===
+suppressPackageStartupMessages({
+  library(dplyr); library(broom); library(lubridate)
+})
+
+# Build the analysis frame (same predictors as before, drop NAs)
+dat <- interval_df %>%
+  select(sample_date, d18Ocellulose,
+         Rs_mean_MJm2_day, CBH_mean_m, diurnal_range_mean, tas_C_mean) %>%
+  na.omit() %>%
+  mutate(month_num = month(sample_date))
+
+# 1) Base model (sunny_frac excluded due to collinearity with Rs)
+fit1 <- lm(d18Ocellulose ~ Rs_mean_MJm2_day + CBH_mean_m +
+             diurnal_range_mean + tas_C_mean, data = dat)
+cat("\n== Base (no seasonality) ==\n")
+print(glance(fit1))
+print(tidy(fit1, digits = 3))
+
+# 2) VIFs without extra packages
+vif_lm <- function(fit) {
+  X <- model.matrix(fit)
+  X <- X[, colnames(X) != "(Intercept)", drop = FALSE]
+  out <- sapply(seq_len(ncol(X)), function(j) {
+    yj <- X[, j]
+    Xj <- X[, -j, drop = FALSE]
+    # if only one column remains or degenerate, protect against singular fits
+    if (ncol(Xj) == 0) return(NA_real_)
+    r2 <- tryCatch({
+      summary(lm(yj ~ Xj))$r.squared
+    }, error = function(e) NA_real_)
+    if (is.na(r2) || r2 >= 1) NA_real_ else 1 / (1 - r2)
+  })
+  data.frame(term = colnames(X), VIF = as.numeric(out), row.names = NULL)
+}
+
+cat("\nVIFs:\n")
+print(vif_lm(fit1))
+
+# 3) Standardized coefficients (z-scores for predictors)
+dat_z <- dat %>%
+  mutate(across(c(Rs_mean_MJm2_day, CBH_mean_m, diurnal_range_mean, tas_C_mean),
+                ~ as.numeric(scale(.)), .names = "z_{col}"))
+fit_z <- lm(d18Ocellulose ~ z_Rs_mean_MJm2_day + z_CBH_mean_m +
+              z_diurnal_range_mean + z_tas_C_mean, data = dat_z)
+cat("\n== Standardized betas ==\n")
+print(tidy(fit_z, digits = 3))
+
+# 4) Add seasonality (month fixed effects)
+fit_season <- lm(d18Ocellulose ~ Rs_mean_MJm2_day + CBH_mean_m +
+                   diurnal_range_mean + tas_C_mean + factor(month_num),
+                 data = dat)
+cat("\n== + Seasonality (month FE) ==\n")
+print(glance(fit_season))
+print(tidy(fit_season, digits = 3))
+
+# 5) Residual diagnostics (base R)
+cat("\nResidual SDs:\n")
+print(c(no_season = sigma(fit1), season = sigma(fit_season)))
+par(mfrow=c(2,2)); plot(fit1); par(mfrow=c(1,1))
+
+```
+```{r}
+# ===== Plot trends from existing analysis objects (no recomputation) =========
+suppressPackageStartupMessages({
+  library(dplyr); library(lubridate); library(ggplot2); library(tidyr); library(zoo)
+})
+
+dir.create("figs", showWarnings = FALSE)
+
+if (exists("interval_df")) {
+  message("Using interval_df (cellulose-interval aggregates).")
+  df <- interval_df %>%
+    transmute(
+      date = as.Date(sample_date),
+      CBH_mean_m,
+      Rs_mean_MJm2_day = Rs_mean_MJm2_day,   # mean daily shortwave within interval
+      Rs_sum_MJm2      = Rs_sum_MJm2,        # total shortwave over the interval
+      interval_days
+    ) %>%
+    arrange(date)
+
+  # 12-interval rolling means (purely cosmetic smoothing)
+  df <- df %>%
+    mutate(
+      CBH_roll = zoo::rollapply(CBH_mean_m, 12, mean, fill = NA, align = "right"),
+      Rs_roll  = zoo::rollapply(Rs_mean_MJm2_day, 12, mean, fill = NA, align = "right")
+    )
+
+  # --- CBH over time (interval means)
+  p_cbh <- ggplot(df, aes(date, CBH_mean_m)) +
+    geom_line(alpha = 0.6) +
+    geom_point(alpha = 0.4, size = 0.6) +
+    geom_line(aes(y = CBH_roll), linewidth = 1) +
+    geom_smooth(method = "lm", se = TRUE, linewidth = 0.6, formula = y ~ as.numeric(x)) +
+    scale_x_date(date_breaks = "10 years", date_labels = "%Y") +
+    labs(title = "Cloud-Base Height (CBH) — interval means & trend",
+         x = NULL, y = "CBH (m)") +
+    theme_minimal(base_size = 12)
+  ggsave("figs/interval_trend_CBH.png", p_cbh, width = 9, height = 4.8, dpi = 300)
+  print(p_cbh)
+
+  # --- Incoming shortwave (mean daily within interval)
+  p_rs_mean <- ggplot(df, aes(date, Rs_mean_MJm2_day)) +
+    geom_line(alpha = 0.6) +
+    geom_point(alpha = 0.4, size = 0.6) +
+    geom_line(aes(y = Rs_roll), linewidth = 1) +
+    geom_smooth(method = "lm", se = TRUE, linewidth = 0.6, formula = y ~ as.numeric(x)) +
+    scale_x_date(date_breaks = "10 years", date_labels = "%Y") +
+    labs(title = "Incoming shortwave — interval mean daily & trend",
+         x = NULL, y = "Mean daily shortwave (MJ m⁻² day⁻¹)") +
+    theme_minimal(base_size = 12)
+  ggsave("figs/interval_trend_Rs_mean.png", p_rs_mean, width = 9, height = 4.8, dpi = 300)
+  print(p_rs_mean)
+
+  # --- Optional: overlay (z-scores) to compare directions on same scale
+  z_long <- df %>%
+    transmute(date,
+              CBH_z = as.numeric(scale(CBH_mean_m)),
+              Rs_z  = as.numeric(scale(Rs_mean_MJm2_day))) %>%
+    pivot_longer(-date, names_to = "variable", values_to = "z")
+
+  p_overlay <- ggplot(z_long, aes(date, z, color = variable)) +
+    geom_line(alpha = 0.8) +
+    geom_smooth(method = "lm", se = FALSE, linewidth = 0.6, formula = y ~ as.numeric(x)) +
+    scale_x_date(date_breaks = "10 years", date_labels = "%Y") +
+    scale_color_manual(values = c("CBH_z" = "#1f77b4", "Rs_z" = "#ff7f0e"),
+                       labels = c("CBH (interval mean)", "Shortwave (interval mean daily)")) +
+    labs(title = "CBH vs incoming radiation — standardized (interval scale)",
+         x = NULL, y = "z-score", color = NULL) +
+    theme_minimal(base_size = 12)
+  ggsave("figs/interval_overlay_z.png", p_overlay, width = 9, height = 4.8, dpi = 300)
+  print(p_overlay)
+
+} else if (exists("monthly")) {
+  message("interval_df not found; using 'monthly' calendar aggregates already in memory.")
+  df <- monthly %>%
+    transmute(
+      date = as.Date(month),
+      CBH_mean_m,
+      Rs_mean_MJm2_day,
+      Rs_sum_MJm2
+    ) %>%
+    arrange(date) %>%
+    mutate(
+      CBH_roll = zoo::rollapply(CBH_mean_m, 12, mean, fill = NA, align = "right"),
+      Rs_roll  = zoo::rollapply(Rs_mean_MJm2_day, 12, mean, fill = NA, align = "right")
+    )
+
+  p_cbh <- ggplot(df, aes(date, CBH_mean_m)) +
+    geom_line(alpha = 0.6) +
+    geom_line(aes(y = CBH_roll), linewidth = 1) +
+    geom_smooth(method="lm", se=TRUE, linewidth=0.6, formula = y ~ as.numeric(x)) +
+    scale_x_date(date_breaks="10 years", date_labels="%Y") +
+    labs(title = "Cloud-Base Height (CBH) — monthly mean & trend", x = NULL, y = "CBH (m)") +
+    theme_minimal(base_size = 12)
+  ggsave("figs/monthly_trend_CBH.png", p_cbh, width = 9, height = 4.8, dpi = 300); print(p_cbh)
+
+  p_rs_mean <- ggplot(df, aes(date, Rs_mean_MJm2_day)) +
+    geom_line(alpha = 0.6) +
+    geom_line(aes(y = Rs_roll), linewidth = 1) +
+    geom_smooth(method="lm", se=TRUE, linewidth=0.6, formula = y ~ as.numeric(x)) +
+    scale_x_date(date_breaks="10 years", date_labels="%Y") +
+    labs(title="Incoming shortwave — mean daily per month & trend",
+         x=NULL, y="Mean daily shortwave (MJ m⁻² day⁻¹)") +
+    theme_minimal(base_size = 12)
+  ggsave("figs/monthly_trend_Rs_mean.png", p_rs_mean, width = 9, height = 4.8, dpi = 300); print(p_rs_mean)
+
+} else {
+  stop("Neither `interval_df` nor `monthly` are in memory. If you already saved them, `readr::read_csv()` them and re-run.")
+}
+
+```
+```{r}
+# ==== Plot time series using existing objects/CSV (robust to col names) ======
+suppressPackageStartupMessages({
+  library(dplyr); library(readr); library(lubridate)
+  library(ggplot2); library(tidyr); library(zoo)
+})
+
+dir.create("figs", showWarnings = FALSE)
+
+# 0) Get a monthly table without recomputing anything
+get_monthly <- function() {
+  if (exists("monthly")) {
+    message("Using in-memory `monthly`.")
+    return(monthly)
+  }
+  if (file.exists("cmip6_timeseries/monthly_cellulose_climate.csv")) {
+    message("Using saved CSV: cmip6_timeseries/monthly_cellulose_climate.csv")
+    return(read_csv("cmip6_timeseries/monthly_cellulose_climate.csv", show_col_types = FALSE))
+  }
+  if (exists("interval_df")) {
+    message("No `monthly` found; building a simple monthly series from `interval_df` by interpolation.")
+    src <- interval_df %>%
+      select(sample_date, CBH_mean_m, Rs_mean_MJm2_day = any_of("Rs_mean_MJm2_day")) %>%
+      arrange(sample_date)
+    # monthly grid
+    mgrid <- tibble(month = seq(floor_date(min(src$sample_date), "month"),
+                                floor_date(max(src$sample_date), "month"),
+                                by = "1 month")) %>% mutate(tnum = as.numeric(month))
+    cbh_ip <- approx(as.numeric(src$sample_date), src$CBH_mean_m, xout = mgrid$tnum, rule = 2)$y
+    # if radiation missing in interval_df, we can't interpolate; leave NA
+    if (!"Rs_mean_MJm2_day" %in% names(src)) rs_ip <- NA_real_[mgrid$tnum] else
+      rs_ip <- approx(as.numeric(src$sample_date), src$Rs_mean_MJm2_day, xout = mgrid$tnum, rule = 2)$y
+    return(mgrid %>% transmute(month, CBH_mean_m = cbh_ip, Rs_mean_MJm2_day = rs_ip))
+  }
+  stop("Couldn't find `monthly` (object or CSV) or `interval_df`. Load one of them and re-run.")
+}
+
+monthly_raw <- get_monthly()
+
+# 1) Harmonize column names / derive what’s needed
+harmonize_monthly <- function(df) {
+  out <- df %>% mutate(month = as.Date(.data[[ if ("month" %in% names(df)) "month" else "date" ]]))
+  # CBH column
+  cbh_candidates <- c("CBH_mean_m","CBH_m_mean","CBH_mean","CBH","CBH_meters_mean")
+  cbh_pick <- intersect(cbh_candidates, names(out))[1]
+  if (is.na(cbh_pick)) stop("Could not find a CBH mean column. Looked for: ", paste(cbh_candidates, collapse=", "))
+  out <- out %>% rename(CBH_mean_m = all_of(cbh_pick))
+
+  # Radiation mean daily:
+  if ("Rs_mean_MJm2_day" %in% names(out)) {
+    # already present
+  } else if (all(c("Rs_sum_MJm2","n_days") %in% names(out))) {
+    out <- out %>% mutate(Rs_mean_MJm2_day = Rs_sum_MJm2 / pmax(n_days, 1))
+  } else if ("Rs_MJ_m2_day" %in% names(out)) {
+    out <- out %>% rename(Rs_mean_MJm2_day = Rs_MJ_m2_day)
+  } else if ("Rs_sum_MJm2" %in% names(out)) {
+    # derive from monthly sum assuming typical month length (fallback)
+    out <- out %>% mutate(Rs_mean_MJm2_day = Rs_sum_MJm2 / days_in_month(month))
+  } else {
+    stop("Could not derive radiation. Need one of: Rs_mean_MJm2_day OR (Rs_sum_MJm2 & n_days) OR Rs_MJ_m2_day.")
+  }
+
+  out %>%
+    select(month, CBH_mean_m, Rs_mean_MJm2_day) %>%
+    arrange(month) %>%
+    distinct(month, .keep_all = TRUE)
+}
+
+monthly_ts <- harmonize_monthly(monthly_raw)
+
+# 2) Add smoothers & anomalies (no recompute of sources)
+monthly_ts <- monthly_ts %>%
+  mutate(
+    CBH_12m = zoo::rollapply(CBH_mean_m, 12, mean, fill = NA, align = "right"),
+    Rs_12m  = zoo::rollapply(Rs_mean_MJm2_day, 12, mean, fill = NA, align = "right"),
+    mo = month(month),
+    CBH_anom = CBH_mean_m - ave(CBH_mean_m, mo, FUN = function(x) mean(x, na.rm = TRUE)),
+    Rs_anom  = Rs_mean_MJm2_day - ave(Rs_mean_MJm2_day, mo, FUN = function(x) mean(x, na.rm = TRUE)),
+    CBH_anom_12m = zoo::rollapply(CBH_anom, 12, mean, fill = NA, align = "right"),
+    Rs_anom_12m  = zoo::rollapply(Rs_anom,  12, mean, fill = NA, align = "right")
+  )
+
+# 3) Plots (saved to figs/)
+p_cbh <- ggplot(monthly_ts, aes(month, CBH_mean_m)) +
+  geom_line(alpha=.5) +
+  geom_line(aes(y=CBH_12m), linewidth=1) +
+  geom_smooth(method="lm", se=TRUE, linewidth=.6, formula = y ~ as.numeric(x)) +
+  labs(title="CBH — monthly mean, 12m smooth, linear trend", x=NULL, y="CBH (m)") +
+  theme_minimal(base_size=12)
+ggsave("figs/ts_cbh_trend.png", p_cbh, width=9, height=4.8, dpi=300); print(p_cbh)
+
+p_rs <- ggplot(monthly_ts, aes(month, Rs_mean_MJm2_day)) +
+  geom_line(alpha=.5) +
+  geom_line(aes(y=Rs_12m), linewidth=1) +
+  geom_smooth(method="lm", se=TRUE, linewidth=.6, formula = y ~ as.numeric(x)) +
+  labs(title="Shortwave — mean daily per month, 12m smooth, linear trend", x=NULL, y="MJ m⁻² day⁻¹") +
+  theme_minimal(base_size=12)
+ggsave("figs/ts_rs_trend.png", p_rs, width=9, height=4.8, dpi=300); print(p_rs)
+
+anom_long <- monthly_ts %>%
+  select(month, CBH_anom_12m, Rs_anom_12m) %>%
+  pivot_longer(-month, names_to="series", values_to="anom")
+
+p_anom <- ggplot(anom_long, aes(month, anom, color=series)) +
+  geom_hline(yintercept = 0, color="grey60") +
+  geom_line(linewidth=.9, na.rm=TRUE) +
+  scale_color_manual(values=c("CBH_anom_12m"="#1f77b4","Rs_anom_12m"="#ff7f0e"),
+                     labels=c("CBH (12m anomaly)", "Shortwave (12m anomaly)")) +
+  labs(title="Seasonally-detrended anomalies (12-month mean)", x=NULL, y="Anomaly", color=NULL) +
+  theme_minimal(base_size=12)
+ggsave("figs/ts_anomalies_12m.png", p_anom, width=9, height=4.8, dpi=300); print(p_anom)
+
+# 4) Tiny trend table (slope per decade with 95% CI)
+trend_summary <- function(dates, y) {
+  t_idx <- as.numeric(dates) / (365.25*10)
+  fit <- lm(y ~ t_idx)
+  ci <- confint(fit)["t_idx",]
+  tibble(slope_per_decade = unname(coef(fit)["t_idx"]),
+         ci_low = ci[1], ci_high = ci[2],
+         p_value = summary(fit)$coefficients["t_idx","Pr(>|t|)"])
+}
+ts_trends <- bind_rows(
+  trend_summary(monthly_ts$month, monthly_ts$CBH_mean_m) %>% mutate(series="CBH (m/decade)"),
+  trend_summary(monthly_ts$month, monthly_ts$Rs_mean_MJm2_day) %>% mutate(series="Shortwave (MJ m^-2 d^-1 per decade)")
+) %>% select(series, everything())
+
+print(ts_trends)
+
+```
 
