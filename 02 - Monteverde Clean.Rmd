@@ -131,56 +131,81 @@ ggplot(annual, aes(year, sunny_frac)) +
 # ---- STEP 3: Summarize climate between cellulose samples and compare with δ18O ----
 library(tidyverse)
 library(lubridate)
+library(purrr)
 
-# --- Define interval breaks from cellulose sampling dates ---
-breaks <- c(min(cellulose$date) - 1, cellulose$date)
+# --- Build true (t1, t2] intervals from cellulose sampling dates ---
+cell_dates <- cellulose %>%
+  distinct(date) %>%
+  arrange(date) %>%
+  pull(date)
 
-# Assign each daily record to the nearest cellulose sampling interval
-daily_labeled <- climate_proc %>%
-  mutate(
-    sample_date = cut(date, breaks = breaks, labels = cellulose$date, right = TRUE),
-    sample_date = as.Date(as.character(sample_date))
-  ) %>%
-  filter(!is.na(sample_date))
+intervals <- tibble(
+  start_date = dplyr::lag(cell_dates),
+  end_date   = cell_dates
+) %>%
+  filter(!is.na(start_date))   # drop the very first sample (no preceding window)
 
-# --- Summarize cloudy/sunny conditions per interval ---
-interval_summary <- daily_labeled %>%
-  group_by(sample_date) %>%
-  summarise(
-    n_days       = n(),
-    cloudy_days  = sum(cloudy, na.rm = TRUE),
-    sunny_days   = sum(sunny, na.rm = TRUE),
-    cloudy_frac  = mean(cloudy, na.rm = TRUE),
-    Rs_mean      = mean(Rs_MJ_m2_day, na.rm = TRUE),
-    CBH_mean     = mean(CBH_m, na.rm = TRUE),
-    tas_mean     = mean(tas_C, na.rm = TRUE),
-    .groups = "drop"
+# --- Helper to summarize one interval; assigns NA means if no climate rows ---
+summarize_interval <- function(start_dt, end_dt) {
+  df <- climate_proc %>% filter(date > start_dt & date <= end_dt)
+  if (nrow(df) == 0) {
+    tibble(
+      n_days      = 0L,
+      cloudy_days = NA_integer_,
+      sunny_days  = NA_integer_,
+      cloudy_frac = NA_real_,
+      Rs_mean     = NA_real_,
+      CBH_mean    = NA_real_,
+      tas_mean    = NA_real_
+    )
+  } else {
+    df %>%
+      summarise(
+        n_days       = n(),
+        cloudy_days  = sum(cloudy, na.rm = TRUE),
+        sunny_days   = sum(sunny,  na.rm = TRUE),
+        cloudy_frac  = mean(cloudy,        na.rm = TRUE),
+        Rs_mean      = mean(Rs_MJ_m2_day,  na.rm = TRUE),
+        CBH_mean     = mean(CBH_m,         na.rm = TRUE),
+        tas_mean     = mean(tas_C,         na.rm = TRUE),
+        .groups = "drop_last"
+      )
+  }
+}
+
+# --- Summarize each (t1, t2] and attach to the *later* cellulose date t2 ---
+interval_summary <- intervals %>%
+  mutate(stats = map2(start_date, end_date, summarize_interval)) %>%
+  unnest(stats) %>%
+  transmute(
+    sample_date = end_date,  # assign summaries to the later date
+    n_days, cloudy_days, sunny_days,
+    cloudy_frac, Rs_mean, CBH_mean, tas_mean
   )
 
-# --- Merge δ18O cellulose values with interval climate ---
+# --- Merge δ18O cellulose values with interval climate (aligned to t2) ---
 interval_data <- interval_summary %>%
   left_join(cellulose, by = c("sample_date" = "date")) %>%
   select(sample_date, d18Ocellulose, cloudy_days, sunny_days,
          cloudy_frac, Rs_mean, CBH_mean, tas_mean)
 
 # ---- Check alignment ----
-glimpse(interval_data)
+summary(interval_data)
 
-# ---- Plot δ18O vs cloudiness ----
+# ---- Plot δ18O vs cloudiness (interval-based, assigned to t2) ----
 ggplot(interval_data, aes(cloudy_frac, d18Ocellulose)) +
   geom_point(alpha = 0.6, color = "steelblue") +
   geom_smooth(method = "loess", se = TRUE, color = "black") +
   labs(
-    title = "δ18O in Cellulose vs. Cloudy-Day Fraction",
-    x = "Fraction of Cloudy Days Between Sampling Dates",
-    y = "δ18O in Cellulose (‰)"
+    title = expression(paste("δ"^18,"O in Cellulose vs. Cloudy-Day Fraction (intervals assigned to t"[2],")")),
+    x = "Fraction of Cloudy Days in (t1, t2]",
+    y = expression(paste("δ"^18,"O (‰)"))
   ) +
   theme_minimal()
 
-# ---- Optional: add simple linear model ----
+# ---- Optional: add simple linear model (interval-based) ----
 fit <- lm(d18Ocellulose ~ cloudy_frac, data = interval_data)
 summary(fit)
-
 
 ```
 ```{r}
@@ -188,6 +213,22 @@ fit_multi <- lm(d18Ocellulose ~ cloudy_frac + Rs_mean + tas_mean, data = interva
 summary(fit_multi)
 
 ```
+```{r}
+
+fit_multi <- lm(d18Ocellulose ~ cloudy_frac + tas_mean, data = interval_data)
+summary(fit_multi)
+
+```
+
+
+
+```{r}
+
+fit_multi <- lm(d18Ocellulose ~ Rs_mean + tas_mean, data = interval_data)
+summary(fit_multi)
+
+```
+
 ```{r}
 # ---- STEP 4: Plot δ18O in cellulose over time ----
 library(ggplot2)
@@ -211,6 +252,72 @@ ggplot(cellulose, aes(x = date, y = d18Ocellulose)) +
 ```
 
 
+```{r}
+# ---- STEP 3b: Model δ18O including CBH and diagnostics (robust to missing n_days) ----
+library(tidyverse)
+library(broom)
+library(car)
+
+# If n_days is missing, add it as NA (so downstream code doesn't fail)
+if (!"n_days" %in% names(interval_data)) {
+  interval_data <- interval_data %>% mutate(n_days = NA_integer_)
+}
+
+# Modeling dataset:
+# - If n_days exists and is non-NA, keep rows with n_days > 0
+# - Otherwise, just require non-missing predictors/response
+mod_df <- interval_data %>%
+  filter(is.na(n_days) | n_days > 0) %>%
+  drop_na(d18Ocellulose, CBH_mean, Rs_mean, tas_mean, cloudy_frac) %>%
+  mutate(
+    z_Rs_mean     = as.numeric(scale(Rs_mean)),
+    z_tas_mean    = as.numeric(scale(tas_mean)),
+    z_CBH_mean    = as.numeric(scale(CBH_mean)),
+    z_cloudy_frac = as.numeric(scale(cloudy_frac))
+  )
+
+# 1) Additive model including CBH
+m_cbh <- lm(d18Ocellulose ~ z_Rs_mean + z_tas_mean + z_CBH_mean + z_cloudy_frac, data = mod_df)
+summary(m_cbh)
+
+# 2) Optional interaction: does CBH modulate the effect of radiation?
+m_cbh_int <- lm(d18Ocellulose ~ z_Rs_mean * z_CBH_mean + z_tas_mean + z_cloudy_frac, data = mod_df)
+summary(m_cbh_int)
+
+# 3) Compare fits
+AIC(m_cbh, m_cbh_int)
+anova(m_cbh, m_cbh_int)  # likelihood-ratio test
+
+# 4) Multicollinearity check
+vif(m_cbh)
+vif(m_cbh_int)
+
+# 5) Partial effect of CBH (others at mean because standardized)
+cbh_grid <- tibble(
+  z_CBH_mean    = seq(min(mod_df$z_CBH_mean), max(mod_df$z_CBH_mean), length.out = 200),
+  z_Rs_mean     = 0,
+  z_tas_mean    = 0,
+  z_cloudy_frac = 0
+)
+pred <- predict(m_cbh, newdata = cbh_grid, se.fit = TRUE)
+cbh_eff <- cbh_grid %>%
+  mutate(fit = pred$fit, se = pred$se.fit, lwr = fit - 1.96 * se, upr = fit + 1.96 * se)
+
+ggplot(cbh_eff, aes(z_CBH_mean, fit)) +
+  geom_ribbon(aes(ymin = lwr, ymax = upr), alpha = 0.2) +
+  geom_line() +
+  labs(
+    title = expression(paste("Partial Effect of CBH on ", delta^{18}, "O (others at mean)")),
+    x = "Standardized CBH (z-score)",
+    y = expression(paste("Predicted ", delta^{18}, "O (‰)"))
+  ) +
+  theme_minimal()
+
+# 6) Quick residual diagnostics
+par(mfrow = c(2,2)); plot(m_cbh); par(mfrow = c(1,1))
+
+
+```
 
 
 
