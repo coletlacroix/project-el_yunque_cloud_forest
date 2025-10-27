@@ -1,0 +1,526 @@
+---
+title: "06 - Connectivity"
+author: "Cole LaCroix"
+date: "2025-10-27"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+# set CRAN mirror (important when knitting)
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+
+# install packages if not already installed
+if(!require(here)) install.packages("here")
+if(!require(terra)) install.packages("terra")
+if(!require(sf)) install.packages("sf")
+if(!require(gdistance)) install.packages("gdistance")
+if(!require(ggplot2)) install.packages("ggplot2")
+if(!require(fitdistrplus)) install.packages("fitdistrplus")
+if(!require(fdrtool)) install.packages("fdrtool")
+if(!require(viridis)) install.packages("viridis")
+
+# load required packages
+library(here)
+library(terra)
+library(sf)
+library(gdistance)
+library(ggplot2)
+library(fitdistrplus)
+library(fdrtool)
+library(viridis)
+```
+
+
+```{r}
+land <- rast('/Users/GitHub Projects/landscape_ecology_wTongQiu/Lab6_data/Lab6_data/panther_landcover.grd')
+public <- read_sf('/Users/GitHub Projects/landscape_ecology_wTongQiu/Lab6_data/Lab6_data/panther_publicland.shp')
+
+plot(land, main = "Land cover and protected areas in Southern Florida")
+plot(st_geometry(public), add = TRUE, border = "red", lwd = 2)
+```
+
+
+```{r}
+# calculate centroids of each protected area
+public_centroids <- st_centroid(public)
+
+# reclassify the land-cover map to create a cost map
+classification <- read.table('/Users/GitHub Projects/landscape_ecology_wTongQiu/Lab6_data/Lab6_data/resistance reclass.txt', header = TRUE)
+
+# takes only columns 1 (land-cover value) and 3 (cost value)
+class <- as.matrix(classification[,c(1,3)])
+
+# create a new raster (land_cost) where each code is cost value
+land_cost <- classify(land, rcl = class)
+```
+
+
+```{r}
+# create a conductance transition layer
+land_cost_raster <- raster(land_cost)
+land_cond <- transition(1 / land_cost_raster, transitionFunction = mean, directions = 8)
+
+# make correction for diagonal connections (8-neighbor rule)
+land_cond <- geoCorrection(land_cond, type = "c", multpl = FALSE)
+
+# convert sf centroids to coordinate matrix
+coords <- st_coordinates(public_centroids)
+
+# Euclidean distance
+geo.dist <- pointDistance(coords, lonlat = F)
+geo.dist <- as.dist(geo.dist)
+geo.dist.km <- geo.dist / 1000
+ 
+# Least-cost distance
+lc.dist <- costDistance(land_cond, coords)
+lc.dist.km <- lc.dist / 1000
+
+# Circuit-theory distance (need a longer running time)
+circuit.dist <- commuteDistance(land_cond, coords)
+circuit.dist.km <- circuit.dist / 1000
+```
+
+```{r}
+# combine into a data frame for comparison
+compare_df <- data.frame(
+  Euclidean = as.vector(geo.dist.km),
+  LeastCost = as.vector(lc.dist.km),
+  Circuit = as.vector(circuit.dist.km)
+)
+
+# disables scientific notation globally
+options(scipen = 999) 
+
+# adds 1:1 line
+panel_1to1 <- function(x, y, ...) {
+  points(x, y, pch = 19, col = "black")   # plot points
+  abline(a = 0, b = 1, col = "red", lwd = 2)  # add 1:1 line
+}
+
+# scatterplot matrix
+pairs(compare_df,
+      main = "Pairwise comparison of connectivity metrics",
+      lower.panel = panel_1to1,
+      upper.panel = panel_1to1)
+```
+
+
+```{r}
+round(cor(compare_df),3)
+```
+
+```{r}
+# crop maps to a smaller extent to reduce computation time and zoom in for detailed visualization
+fpwr_ossf_extent <- extent(642000, 683000, 237000, 298000)
+
+# crop the original land-cover raster (land) to the specified extent
+land_sub <- crop(land, fpwr_ossf_extent)
+
+# crop the cost raster to the same extent
+land_cost_sub <- crop(land_cost, fpwr_ossf_extent)
+
+# convert the cropped cost layer into a RasterLayer object (required for gdistance functions)
+land_cost_sub_raster <- raster(land_cost_sub)
+
+# create a 'transition layer' representing conductance (ease of movement)
+# '1 / cost' means low cost = high conductance
+# 'transitionFunction = mean' calculates conductance between adjacent cells
+# '8' specifies 8-directional (diagonal) neighborhood connectivity
+land_cond_sub <- transition(1 / land_cost_sub_raster, transitionFunction = mean, 8)
+
+# apply geometric correction to account for diagonal distances and ensure accurate cost calculations
+# type = "c" (correction for least-cost analysis)
+land_cond_sub <- geoCorrection(land_cond_sub, type = "c", multpl = F)
+
+# compute the least-cost path between two protected area centroids
+# origin = centroid 5, goal = centroid 3; output returned as SpatialLines object
+fpwr_ossf_lcp <- shortestPath(land_cond,
+                              origin = coords[5, ],
+                              goal   = coords[3, ],
+                              output = "SpatialLines")
+
+public_sub <- public[public$MA_ID == "999" | public$MA_ID == "1341",]
+  
+# plot the cropped cost surface (lower values = easier movement)
+# add boundaries of protected areas to the map
+# add centroid locations of protected areas (gray points)
+# overlay the computed least-cost path as a red line connecting origin and goal
+plot(land_cost_sub, axes=F, box=F)
+plot(public_sub, add = T, border = "black", col = NA, lwd = 4)
+lines(fpwr_ossf_lcp, col = "red", lwd = 3)
+points(public_centroids, col="grey70", pch = 19, cex = 1.5)
+```
+
+
+```{r}
+# get cumulative costs from each PA
+fpwr.cost <- accCost(land_cond_sub, coords[5, ])
+ossf.cost <- accCost(land_cond_sub, coords[3, ])
+
+plot
+par(mfrow=c(1,2))
+plot(fpwr.cost)
+plot(ossf.cost)
+
+# get least-cost corridor
+leastcost_corridor <- overlay(fpwr.cost, ossf.cost, fun=function(x, y){return(x + y)})
+
+# get lower quantile
+# calculates the 10th percentile of all pixel values in your leastcost_corridor raster.
+# lower values in this raster represent lower cumulative cost (easier movement).
+# the 10th percentile corresponds to the lowest-cost 10% of all cells — effectively the most efficient potential movement corridor.
+quantile10 <- quantile(leastcost_corridor, probs=0.10, na.rm=TRUE)
+
+# make new layer
+leastcost_corridor10 <- leastcost_corridor
+values(leastcost_corridor10) <- NA
+leastcost_corridor10[leastcost_corridor < quantile10] <- 1 #truncate to identify corridor
+
+#plot
+plot(leastcost_corridor, legend=F, axes=F)
+plot(leastcost_corridor10, col = "#33a02c", legend=F,axes=F, add=T)
+plot(public_sub, add=T, border = "black", col = NA, lwd = 3)
+points(public_centroids, col="grey30")
+lines(fpwr_ossf_lcp, col="red", lw=3)
+```
+
+
+```{r}
+# crop maps to a smaller extent to reduce computation time and zoom in for detailed visualization
+fpwr_ossf_extent <- extent(642000, 683000, 237000, 298000)
+
+# crop the original land-cover raster (land) to the specified extent
+land_sub <- crop(land, fpwr_ossf_extent)
+
+fpwr.cost <- accCost(land_cond_sub, coords[5, ])
+ossf.cost <- accCost(land_cond_sub, coords[3, ])
+leastcost_corridor <- overlay(fpwr.cost, ossf.cost, fun=function(x, y){return(x + y)})
+leastcost_corridor10 <- leastcost_corridor
+values(leastcost_corridor10) <- NA
+quantile10 <- quantile(leastcost_corridor, probs=0.10, na.rm=TRUE)
+leastcost_corridor10[leastcost_corridor < quantile10] <- 1 #truncate to identify corridor
+leastcost_corridor10 <- rast(leastcost_corridor10)
+crs(leastcost_corridor10) <- crs(land_sub)
+
+corridor.land <- mask(land_sub, leastcost_corridor10)
+classification[, 1:2]
+```
+
+```{r}
+plot
+plot(corridor.land, main= "Land cover within 10% least-cost corridor")
+plot(public_sub, add = TRUE, border = "black", col = NA)
+points(public_centroids, col = "grey30", pch = 19)
+```
+
+
+```{r}
+# extract all land-cover values (excluding NA)
+vals <- values(corridor.land)
+vals <- vals[!is.na(vals)]
+
+pixel_counts <- as.data.frame(table(vals))
+colnames(pixel_counts) <- c("LandCoverCode", "Count")
+pixel_counts$Percent <- 100 * pixel_counts$Count / sum(pixel_counts$Count)
+
+# summarize pixel counts per land-cover class
+pixel_counts <- merge(pixel_counts, classification[, 1:2],
+                      by.x = "LandCoverCode", 
+                      by.y = names(classification)[1],
+                      all.x = TRUE)
+
+ggplot(pixel_counts, aes(x = reorder(Description, -Percent), y = Percent)) +
+  geom_bar(stat = "identity", fill = "#33a02c") +
+  theme_bw() +
+  labs(
+    title = "Proportion of land-cover types in 10% corridor",
+    x = NULL,
+    y = "Percent of pixels (%)"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+```{r}
+# each row represents a wetland, with its name, coordinates, and area (km²)
+nodes <- read.csv('/Users/GitHub Projects/landscape_ecology_wTongQiu/Lab6_data/Lab6_data/kite_nodes.csv', header = TRUE)
+
+# use the columns "XCoord" and "YCoord" as spatial coordinates
+nodes_sf <- st_as_sf(nodes, coords = c("XCoord", "YCoord")) 
+
+# plot the wetland nodes scaling point size by wetland area
+ggplot(nodes_sf) +
+  # plot each node as a filled circle with size scaled to area
+  geom_sf(aes(size = area), color = "black", fill = "skyblue", shape = 21, alpha = 0.8) + 
+  # add wetland names as bold text labels above each point
+  geom_sf_text(aes(label = Name), size = 3, fontface = "bold", nudge_y = 10000) +
+  # define how the node sizes vary (range = circle size)
+  scale_size_continuous(range = c(2, 10), name = "Wetland Area (km2)") +
+  # use coordinate system from sf object
+  coord_sf() +
+  # apply a clean, minimal plotting theme for clarity
+  theme_minimal(base_size = 13) +
+  # customize theme: rotate axis labels, adjust gridlines and title style
+  theme(
+  axis.text.x = element_text(angle = 45, hjust = 1),
+  axis.text.y = element_text(angle = 45, hjust = 1),
+  panel.grid.major = element_line(color = "grey90"),
+  panel.background = element_rect(fill = "white"),
+  plot.title = element_text(size = 16, face = "bold", hjust = 0.5)
+)
+```
+
+
+```{r}
+# each cell represents the number of recorded movements from one wetland (row = origin) to another (column = destination)
+A.obs <- read.csv('/Users/GitHub Projects/landscape_ecology_wTongQiu/Lab6_data/Lab6_data/kite_movement.csv', header=TRUE)
+
+# A.obs becomes a 29 × 29 adjacency matrix where entries represent movement frequencies
+A.obs <- as.matrix(A.obs[,2:30])
+
+# re-label the matrix rows and columns with numeric IDs (1–29)
+rownames(A.obs) <- 1:29
+colnames(A.obs) <- 1:29
+
+# set the diagonal elements to zero to remove "self-movements" (staying in the same wetland) so that only true dispersal between different sites is considered
+diag(A.obs) <- 0
+
+# create a coordinate matrix (X and Y) from the node for distance calculations
+# each row represents the centroid of a wetland
+coords <- cbind(nodes$XCoord, nodes$YCoord)
+
+# compute the pairwise Euclidean distances between all wetland sites
+distmat <- pointDistance(coords, lonlat=F)
+distmat <- distmat/1000 #in km
+```
+
+
+```{r}
+# 'A.obs' is the movement adjacency matrix (origin–destination frequencies).
+# returns all matrix cell positions where movement counts > 0 (i.e., actual observed dispersal events).
+link.loc <- which(A.obs>0, arr.ind=T)
+
+# link each movement record with the Euclidean distance between sites.
+# for each origin–destination pair that had movements (link.loc).
+# retrieve the corresponding distance from 'distmat' and the number of observed movements.
+# the resulting matrix has two columns: [distance, movement_count].
+within_disp <- cbind(distmat[link.loc], A.obs[link.loc])
+
+# expand the dataset so that each individual movement is represented once.
+# for example, if 5 movements occurred between two sites 30 km apart, that distance (30) will be repeated 5 times.
+within_disp <- rep(within_disp[,1], within_disp[,2])
+
+# calculate summary statistics for dispersal distances.
+mean.dist <- mean(within_disp)         #mean is 72
+max.dist <- max(within_disp)           #max movement distance is 267 km
+# max(distmat)                         #max distance between nodes: 296 km
+
+# fit candidate dispersal distributions to the observed data
+# using maximum likelihood estimation (MLE). Each represents a hypothesis about how dispersal probability declines with distance.
+disp.lnorm <- fitdist(data=within_disp, distr="lnorm", method="mle")
+disp.exp <- fitdist(data=within_disp, distr="exp", method="mle")
+disp.weib <- fitdist(data=within_disp, distr="weibull", method="mle")
+disp.1dt <- fitdist(data=within_disp, distr="halfnorm", start=list(theta=0.01), method="mle")
+
+# compare model fits using Akaike Information Criterion (AIC)
+disp.AIC <- gofstat(list(disp.exp, disp.lnorm, disp.weib, disp.1dt),
+                  fitnames=c("exponential", "lognormal", "Weibull", "1Dt"))
+
+# plot histogram of observed dispersal distances showing the empirical frequency distribution of distances (in km).
+hist(disp.exp$data, breaks = 30, probability = TRUE,
+     col = "grey80", border = "white",
+     main = "Observed dispersal data with fitted distributions",
+     xlab = "Dispersal distance (km)")
+
+# generate a sequence of distances for smooth model curves
+x <- seq(min(disp.exp$data), max(disp.exp$data), length = 300)
+
+# add distribution curves
+lines(x, dlnorm(x, meanlog = disp.lnorm$estimate[1],
+                sdlog = disp.lnorm$estimate[2]),
+      col = "#7570b3", lwd = 3)
+
+lines(x, dexp(x, rate = disp.exp$estimate),
+      col = "#1b9e77", lwd = 3)
+
+lines(x, dweibull(x, shape = disp.weib$estimate[1],
+                  scale = disp.weib$estimate[2]),
+      col = "#d95f02", lwd = 3)
+
+lines(x, dhalfnorm(x, theta = disp.1dt$estimate),
+      col = "#66a61e", lwd = 3)
+
+# add legend identifying each fitted distribution
+legend("topright",
+       legend = c("Lognormal", "Exponential", "Weibull", "Half-normal"),
+       col = c("#7570b3", "#1b9e77", "#d95f02", "#66a61e"),  # teal, violet, orange, olive
+       lwd = 2, bty = "n")
+```
+
+
+```{r}
+# create a binary adjacency matrix based on the mean observed dispersal distance.
+# initialize an empty (all-zero) square matrix with the same dimensions as A.obs.
+A.mean <- matrix(0, nrow=nrow(A.obs), ncol=ncol(A.obs))
+
+# assign 1 (connected) to all site pairs whose distance is less than the mean dispersal distance. This means any two wetlands closer than the average movement distance are considered "connected".
+A.mean[distmat < mean.dist] <- 1
+
+# set diagonal elements to zero to remove self-connections (no site is connected to itself).
+diag(A.mean) <- 0
+
+# create an adjacency matrix where connection strength decreases with distance, following a negative exponential decay function: exp(-α * distance).
+A.prob <- matrix(0, nrow=nrow(A.obs), ncol=ncol(A.obs))
+
+# define the decay parameter alpha (α) as the inverse of the mean dispersal distance. This controls how quickly connection probability declines with distance.
+alpha <- 1/mean.dist
+
+# apply the exponential distance-decay function to all site pairs: short distances → values near 1 (strong connection); long distances → values near 0 (weak connection)
+A.prob <- exp(-alpha*distmat)
+diag(A.prob) <- 0
+
+# convert each adjacency matrix into an igraph network object.
+# 1. binary (threshold-based) network: undirected, no weights.
+graph.Amean <- graph.adjacency(A.mean, mode="undirected")
+
+# 2. probabilistic network: undirected, weighted by exponential connection strength.
+graph.Aprob <- graph.adjacency(A.prob, mode="undirected", weighted=T)
+
+# 3. observed movement network: directed, weighted by number of observed movements.
+graph.Aobs <- graph.adjacency(A.obs, mode="directed", weighted=T)
+
+#plot
+plot(graph.Amean, layout=coords, vertex.label = NA)
+```
+
+```{r}
+plot(graph.Aprob, layout=coords, edge.width=E(graph.Aprob)$weight*10, vertex.label=NA)
+```
+
+```{r}
+plot(graph.Aobs, layout=coords, edge.width=E(graph.Aobs)$weight/2, vertex.label=NA)
+```
+
+```{r}
+# compute centrality metrics
+Amean.degree <- degree(graph.Amean)
+Amean.eigen <- evcent(graph.Amean)
+Amean.close <- closeness(graph.Amean)
+Amean.betweenness <- betweenness(graph.Amean)
+
+# modularity (community detection)
+Amean.modularity <- cluster_louvain(graph.Amean)
+modules <- membership(Amean.modularity)
+
+# combine metrics and titles
+metrics <- list(
+  Degree = Amean.degree,
+  Eigenvector = Amean.eigen,
+  Closeness = Amean.close,
+  Betweenness = Amean.betweenness,
+  Modules = modules
+)
+titles <- names(metrics)
+
+# assign one distinct color per metric
+metric_colors <- c(
+  Degree = "#1b9e77",      
+  Eigenvector = "#7570b3", 
+  Closeness = "#d95f02",   
+  Betweenness = "#66a61e"  
+)
+
+# set layout and margins
+par(
+  mfrow = c(1, 5),       # 1 row, 5 columns
+  mar = c(0.5, 0.5, 0.5, 0.5),   # smaller top margin
+  oma = c(0, 0, 1, 0),   # outer margins
+  cex = 1             # scale text size
+)
+
+# loop through and plot
+for (i in seq_along(metrics)) {
+  metric_values <- metrics[[i]]
+  
+  # handle eigenvector
+  if (is.list(metric_values) && "vector" %in% names(metric_values)) {
+    metric_values <- metric_values$vector
+  }
+  
+  metric_values <- as.numeric(metric_values)
+  
+  # assign node colors and sizes
+  if (titles[i] == "Modules") {
+    
+    # color = community membership; constant size
+    n_mod <- length(unique(metric_values))
+    node_colors <- viridis(n_mod, option = "C")[as.numeric(as.factor(metric_values))]
+    node_size <- rep(8, length(metric_values))
+  } else {
+    # same color for each metric; size = metric magnitude
+    node_colors <- rep(metric_colors[titles[i]], length(metric_values))
+    node_size <- 25 * (metric_values / max(metric_values, na.rm = TRUE))
+  }
+  
+  # plot network (no title here)
+  plot(
+    graph.Amean,
+    layout = coords,
+    vertex.size = node_size,
+    vertex.color = node_colors,
+    vertex.frame.color = "black",
+    vertex.label = NA,
+    edge.color = "grey60",
+    edge.width = 1.5,
+    main = titles[i],
+    font.main = 2
+  )
+}
+```
+
+
+```{r}
+# transition matrix for raster layer
+land_cost_sub_raster <- raster(land_cost_sub)
+land_cost_subt <- transition(land_cost_sub_raster, transitionFunction=mean, 8)
+land_cost_subt <- geoCorrection(land_cost_subt, type="c", multpl=FALSE)
+
+# sparse matrix of transition layer
+land.matrix <- transitionMatrix(land_cost_subt)                              
+
+# now take the sparse matrix and use igraph for analysis
+land.graph <- graph.adjacency(land.matrix, mode="undirected", weighted=T) 
+land.between <- betweenness(land.graph, directed=F)
+
+#map the betweenness and contrast with least-cost corridor
+land.between.map <- setValues(land_cost_sub, land.between)
+
+corridor.mask <- classify(corridor.land, cbind(NA, 0))  # replace NAs with 0
+corridor.mask[corridor.mask > 0] <- 1 
+corridor.vector <- as.polygons(corridor.mask, dissolve = TRUE)
+corridor.vector <- st_as_sf(corridor.vector)
+
+#plot
+par(mfrow=c(1,1))
+plot(
+  land.between.map,
+  col = viridis(256, option = "magma"),
+  axes = TRUE,
+  legend = TRUE,
+  main = "Betweenness centrality"
+)
+plot(st_geometry(public_sub), add = TRUE, col = "grey70", border = NA)
+plot(st_geometry(corridor.vector),
+     add = TRUE, border = "white", lwd = 1.5)
+```
+
+```{r}
+
+```
+
+
