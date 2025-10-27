@@ -519,8 +519,55 @@ plot(st_geometry(corridor.vector),
      add = TRUE, border = "white", lwd = 1.5)
 ```
 
-```{r}
+# Exercise Q1. Please create a map showing the cost surface (land_cost) overlaid with the protected areas (public) and their centroids (public_centroids).
 
-```
+
+# Exercise Q2. Please explain what ecological factors (e.g., barriers, habitat heterogeneity) could cause differences among Euclidean, Least-cost, and Circuit distances. What conditions would the differences between these metrics be larger? When would they be smaller? (15 points)
+
+
+# Exercise Q3. Repeat the least-cost corridor analysis, but this time choose a different pair of protected areas (not the same as in the example).
+
+## Compute and map the accumulated cost surfaces for both protected areas.
+
+
+## Derive the least-cost map by summing the two cost surfaces and map (5 points).
+
+
+## Identify and visualize the lowest-cost 15% corridor using a quantile threshold (5 points).
+
+
+## Add the protected area boundaries, centroids, and least-cost path on the map (5 points).
+
+
+## Interpretation: How does the corridor’s width and shape change when you use a 15% threshold instead of 10%? What does this change mean? (5 points)
+
+
+# Exercise Q4. Suppose a new urban development is planned within one of the dominant land-cover types within the corridor.
+
+## How might this development affect species movement (i.e., the least-cost path) between protected areas? (5 points)
+
+
+## How could least-cost corridor analysis help guide mitigation or conservation planning? (5 points)
+
+
+# Exercise Q5. Based on the fitted dispersal kernels (Lognormal, Exponential, Weibull, and Half-normal):
+
+## Interpret the pattern of observed dispersal distances shown in the figure (5 points).
+
+
+## Which distribution do you think best fits the data, and why? (consider both the statistical fit and data distribution) (10 points)
+
+
+# Exercise Q6. The above five network maps showing Degree, Eigenvector, Closeness, Betweenness, and Modules centrality for the snail kite wetland network.
+
+## Choose three of these metrics and describe what each measures in ecological terms (5 points).
+
+
+## Identify which regions appear most important under one of these metrics. (Hint: which areas have the largest node values, and what does that means for movement or connectivity?) (5 points)
+
+
+# Exercise Q7. Using the betweenness map shown above, evaluate how management priorities might change when considering multiple high-centrality corridors instead of a single least-cost route. In your answer, consider implications for species with varying dispersal abilities or behavioral responses to cost (resistance) surfaces (10 points).
+
+
 
 
